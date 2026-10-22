@@ -1,0 +1,9 @@
+notifier_data.json
+notifier_data.json.tmp
+hb_*.txt
+wlog_*.log
+*.bak
+*.log
+__pycache__/
+venv/
+go-worker/notifier-worker

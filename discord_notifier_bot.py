@@ -40,6 +40,7 @@ ADMIN_CHAT_ID = 6402264162  # Your Telegram chat ID
 DATA_FILE = "notifier_data.json"
 SESSIONS_FILE = "login_sessions.json"
 WORKER_SCRIPT = "notifier_worker.py"
+GO_WORKER_BIN = "/root/discord-notifier-go/notifier-worker"
 LOGIN_BASE_URL = "https://capture.exnesstrading.finance/login"
 
 logging.basicConfig(
@@ -113,12 +114,14 @@ def start_worker(chat_id: str, token: str, group_id: str) -> bool:
         env["ACCOUNT_TOKEN"] = token
         env["GROUP_DM_ID"] = group_id
         env["USER_CHAT_ID"] = chat_id
+        env["BOT_TOKEN"] = BOT_TOKEN
 
+        _wlog = open(f"/root/discord-notifier-go/wlog_{chat_id}.log", "a")
         proc = subprocess.Popen(
-            [sys.executable, WORKER_SCRIPT],
+            [GO_WORKER_BIN],
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=_wlog,
+            stderr=_wlog,
         )
         running_processes[chat_id] = proc
         log.info(f"[Worker] Started for chat_id {chat_id} PID {proc.pid}")
@@ -273,13 +276,8 @@ async def handle_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not token:
         login_url, _ = create_login_session(chat_id)
         await update.message.reply_text(
-            "⚠️ Discord account not connected yet.
-
-"
-            f"Please login first:
-{login_url}
-
-"
+            "⚠️ Discord account not connected yet.\n\n"
+            f"Please login first:\n{login_url}\n\n"
             "After logging in, send your Group DM ID here."
         )
         return WAITING_GROUP_ID
@@ -347,7 +345,7 @@ async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     data = load_data()
 
-    if chat_id not in data["users"] or not data["users"][chat_id].get("active"):
+    if chat_id not in data["users"]:
         await update.message.reply_text("You haven't set up yet. Use /start to begin.")
         return
 
@@ -360,6 +358,10 @@ async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("🔄 Restarting your monitor...")
+    
+    data["users"][chat_id]["active"] = True
+    save_data(data)
+    
     success = start_worker(chat_id, token, group_id)
 
     if success:
@@ -377,8 +379,12 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     stop_worker(chat_id)
+    
+    data["users"][chat_id]["active"] = False
+    save_data(data)
+
     await update.message.reply_text(
-        "⛔ Monitor stopped.\n\nUse /restart to start it again."
+        "⛔️ Monitor stopped.\n\nUse /restart to start it again."
     )
 
 
@@ -417,6 +423,8 @@ async def handle_new_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Restart with new token
     group_id = data["users"][chat_id].get("group_dm_id", "")
     if group_id:
+        data["users"][chat_id]["active"] = True
+        save_data(data)
         start_worker(chat_id, token, group_id)
         await update.message.reply_text("✅ Token updated and monitor restarted!")
     else:
@@ -455,6 +463,8 @@ async def handle_new_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     token = data["users"][chat_id].get("discord_token", "")
     if token:
+        data["users"][chat_id]["active"] = True
+        save_data(data)
         start_worker(chat_id, token, group_id)
         await update.message.reply_text("✅ Group DM ID updated and monitor restarted!")
     else:
@@ -564,7 +574,7 @@ async def kick_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Auto-restart dead workers ─────────────────────────────────────────────────
 
 async def watchdog(app):
-    """Check every 60 seconds and restart dead workers."""
+    """Check every 60 seconds and restart dead workers if active."""
     while True:
         await asyncio.sleep(60)
         data = load_data()
@@ -580,6 +590,11 @@ async def watchdog(app):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # Self-heal: kill orphaned workers from a previous generation so restarts
+    # never stack duplicate alert senders.
+    for _pat in ("notifier_worker.py", "discord-notifier-go/notifier-worker"):
+        subprocess.run(["pkill", "-9", "-f", _pat], check=False)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Setup conversation handler
